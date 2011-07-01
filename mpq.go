@@ -2,20 +2,23 @@ package mpq
 
 import (
 	"./file"
+	"./encryptedfile"
 	"encoding/binary"
 //	"bytes"
 	"os"
 	"fmt"
+//	"strings"
 )
 
 // derived from: http://wiki.devklog.net/index.php?title=The_MoPaQ_Archive_Format
 // with some help from: https://github.com/arkx/mpyq/blob/master/mpyq.py
 
 type MPQHeader struct {
+	Magic [4]byte
 	HeaderSize int32
 	ArchiveSize int32
 	FormatVersion int16
-	SectorSizeShift int8
+	SectorSizeShift int16 // MoPaQ wiki lists this as int8, but this fails
 	HashTableOffset int32
 	BlockTableOffset int32
 	HashTableEntries int32
@@ -23,6 +26,7 @@ type MPQHeader struct {
 }
 
 type MPQUserDataHeader struct {
+	Magic [4]byte
 	UserDataSize int32
 	ArchiveHeaderOffset int32
 	UserData []byte
@@ -34,73 +38,83 @@ type MPQHeaderExt struct {
 	BlockTableOffsetHigh int16
 }
 
-type BlockEntry struct {
+type BlockTableEntry struct {
 	BlockOffset int32
 	BlockSize int32
 	FileSize int32
 	Flags int32
 }
 
-/* WORK IN PROGRESS
-func (be *BlockEntry) Decrypt(dst, src []byte) {
-	seed1 := []byte("(block entry)")
-	var seed2 uint64 = 0xEEEEEEEE
-	for i := 0 ; i < len(dst)/4; i++ {
-		// TODO: need encryption table
-		// can we have static sections to initialise stuff?
-	}
-}*/
+type HashTableEntry struct {
+	FilePathHashA int32
+	FilePathHashB int32
+	Language int16
+	Platform int16 // another case where int8 is listed
+	FileBlockIndex int32
+}
 
 type MPQFile struct {
-	Shunt *MPQUserDataHeader
+	file *file.File
+	UserDataHeader *MPQUserDataHeader
 	Header *MPQHeader
 	HeaderExt *MPQHeaderExt
-	Blocks []BlockEntry
+	BlockTable []BlockTableEntry
+	HashTable []HashTableEntry
 }
 
-func readUserDataHeader(f *file.File) (udh *MPQUserDataHeader, err os.Error) {
-	udh = new(MPQUserDataHeader)
-	e := binary.Read(f, binary.LittleEndian, &udh.UserDataSize)
+func (f *MPQFile) readUserDataHeader() (e os.Error) {
+	f.UserDataHeader = new(MPQUserDataHeader)
+	e = binary.Read(f.file, binary.LittleEndian,
+		&f.UserDataHeader.Magic)
 	if e != nil {
-		return nil, err
+		return e
 	}
-	e = binary.Read(f, binary.LittleEndian, &udh.ArchiveHeaderOffset)
+	e = binary.Read(f.file, binary.LittleEndian, 
+		&f.UserDataHeader.UserDataSize)
 	if e != nil {
-		return nil, err
+		return e
 	}
-	udh.UserData = make([]byte, udh.UserDataSize)
-	r, e := f.Read(udh.UserData)
-	if r < 1 { // 0 is EOF, TODO: support this case too
-		fmt.Printf("Problem reading header: %s\n", e.String())
-		return nil,e
+	e = binary.Read(f.file, binary.LittleEndian, 
+		&f.UserDataHeader.ArchiveHeaderOffset)
+	if e != nil {
+		return e
 	}
-	return udh,e
+	f.UserDataHeader.UserData = make([]byte, f.UserDataHeader.UserDataSize)
+	_, e = f.file.Read(f.UserDataHeader.UserData)
+	return e
 }
 
-func readHeader(f *file.File) (h *MPQHeader, err os.Error) {
-	h = new(MPQHeader)
-	e := binary.Read(f, binary.LittleEndian, h)
-	if e != nil {
-		return nil, err
-	}
-	return h,e
+func (f *MPQFile) readHeader() (e os.Error) {
+	f.Header = new(MPQHeader)
+	e = binary.Read(f.file, binary.LittleEndian, f.Header)
+	return e
 }
 
-func readHeaderExt(f *file.File) (h *MPQHeaderExt, err os.Error) {
-	h = new(MPQHeaderExt)
-	e := binary.Read(f, binary.LittleEndian, h)
-	if e != nil {
-		return nil, err
-	}
-	return h,e
+func (f *MPQFile) readHeaderExt() (e os.Error) {
+	f.HeaderExt = new(MPQHeaderExt)
+	e = binary.Read(f.file, binary.LittleEndian, f.HeaderExt)
+	return e
+}
+
+func (f *MPQFile) readHashTable() (e os.Error) {
+	var key uint32 = encryptedfile.HashString("(hash table)", 
+		encryptedfile.MPQ_HASH_TABLE_OFFSET)
+	f.file.Seek(int64(f.Header.HashTableOffset), 0)
+	f.HashTable = make([]HashTableEntry, f.Header.HashTableEntries)
+	fmt.Printf("trying to read %d hash table entries", f.Header.HashTableEntries)
+	ef := encryptedfile.NewEncryptedFile(f.file, key)
+	e = binary.Read(ef, binary.LittleEndian, f.HashTable)
+	return e
 }
 
 func readFile(f *file.File) (mpqFile *MPQFile, err os.Error) {
 
 	mpqFile = new(MPQFile)
+	mpqFile.file = f
 
 	var magic [4]byte
-	r, e := f.Read(magic[:])
+	r, e := mpqFile.file.Read(magic[:])
+	mpqFile.file.Seek(0, 0)
 	if r < 1 { // 0 is EOF, TODO: support this case too
 		fmt.Printf("Problem reading header: %s\n", e.String())
 		return nil,e
@@ -111,14 +125,14 @@ func readFile(f *file.File) (mpqFile *MPQFile, err os.Error) {
 		return nil,e
 	}
 
-	if magic[3] == '\x1B' { // user data shunt is first
-		mpqFile.Shunt, e = readUserDataHeader(f)
-		//fmt.Printf("magic: %d, %d, %d, %s\n", magic, mpqFile.Shunt.UserDataSize, mpqFile.Shunt.ArchiveHeaderOffset, mpqFile.Shunt.UserData)
+	if magic[3] == '\x1B' { // user data header is first
+		e = mpqFile.readUserDataHeader()
 		if e != nil {
 			return nil,e
 		}
-		f.Seek(int64(mpqFile.Shunt.ArchiveHeaderOffset), 0)
-		r, e := f.Read(magic[:])
+		mpqFile.file.Seek(int64(mpqFile.UserDataHeader.ArchiveHeaderOffset), 0)
+		r, e := mpqFile.file.Read(magic[:])
+		mpqFile.file.Seek(int64(mpqFile.UserDataHeader.ArchiveHeaderOffset), 0)
 		switch {
 		case r < 1:
 			//fmt.Printf("Problem reading header: %s\n", e.String())
@@ -127,6 +141,9 @@ func readFile(f *file.File) (mpqFile *MPQFile, err os.Error) {
 			return mpqFile,e
 		default:
 		}
+	} else {
+		mpqFile.UserDataHeader = new(MPQUserDataHeader)
+		mpqFile.UserDataHeader.ArchiveHeaderOffset = 0
 	}
 		
 	if magic[3] != '\x1A' {
@@ -134,20 +151,19 @@ func readFile(f *file.File) (mpqFile *MPQFile, err os.Error) {
 		return nil,os.NewError("Unexpected magic value")
 	}
 	
-	mpqFile.Header, e = readHeader(f)
+	e = mpqFile.readHeader()
 	if e != nil {
 		return nil,e
 	}
 	if mpqFile.Header.FormatVersion == 1 {
-		mpqFile.HeaderExt,e = readHeaderExt(f)
+		e = mpqFile.readHeaderExt()
 		if e != nil {
 			return nil,e
 		}
 	}
 
-	mpqFile.Blocks = make([]BlockEntry, mpqFile.Header.BlockTableEntries)
-	//f.Seek(MPQFile.Header.BlockTableOffset
-
+	e = mpqFile.readHashTable()
+	
 	return mpqFile, e
 }
 

@@ -45,6 +45,7 @@ func (file *File) Close() os.Error {
 	if file == nil {
 		return os.EINVAL
 	}
+	fmt.Printf("file.Close()\n");
 	e := syscall.Close(file.fd)
 	file.fd = -1 // so it can't be closed again
 	if e != 0 {
@@ -54,11 +55,11 @@ func (file *File) Close() os.Error {
 }
 
 func (file *File) Read(b []byte) (ret int, err os.Error) {
-	fmt.Printf("Called file.Read(%s)\n", len(b));
 	if file == nil {
 		return -1, os.EINVAL
 	}
 	r, e := syscall.Read(file.fd, b)
+	fmt.Printf("file.Read() read: %d bytes\n", r);
 	if e != 0 {
 		err = os.Errno(e)
 	}
@@ -80,6 +81,7 @@ func (file *File) Seek(offset int64, whence int) (ret int, err os.Error) {
 	if file == nil {
 		return -1, os.EINVAL
 	}
+	fmt.Printf("file.Seek(%d,%d)\n", offset, whence);
 	r, e := syscall.Seek(file.fd, offset, whence)
 	if e != 0 {
 		err = os.Errno(e)
